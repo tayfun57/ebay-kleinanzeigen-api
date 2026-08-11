@@ -68,6 +68,22 @@ Set the `HEADLESS` environment variable to `false` to watch the browser while sc
 HEADLESS=false uvicorn main:app --reload
 ```
 
+#### Proxy support (IPv4 + IPv6)
+
+To rotate outbound requests through a pool of proxies (avoids IP bans under
+sustained scraping), provide a list of proxy URLs either via the `PROXY_LIST`
+env var (comma- or newline-separated) or a `proxies.txt` file (one proxy URL
+per line, `#` for comments — see `proxies.txt.example`). Both IPv4 and IPv6
+proxy hosts are supported, with or without credentials:
+
+```sh
+PROXY_LIST="http://user:pass@203.0.113.10:8080,http://user:pass@[2001:db8::1]:8080" uvicorn main:app --reload
+```
+
+Each new browser context is assigned the next proxy in the list, round-robin.
+If neither `PROXY_LIST` nor `proxies.txt` is present, no proxy is used
+(unchanged default behavior).
+
 ### Installation using UV
 
 #### Prerequisites

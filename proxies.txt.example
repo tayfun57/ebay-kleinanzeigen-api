@@ -1,0 +1,7 @@
+# One proxy URL per line. Lines starting with # are ignored.
+# Copy this file to proxies.txt (gitignored) and fill in your real credentials.
+# Both IPv4 and IPv6 proxy hosts are supported.
+#
+# http://user:pass@203.0.113.10:8080
+# http://user:pass@[2001:db8::1]:8080
+# socks5://user:pass@198.51.100.7:1080

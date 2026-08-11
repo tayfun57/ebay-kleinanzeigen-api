@@ -9,3 +9,4 @@ tests/
 *.md
 .claude/
 uv.lock
+proxies.txt
