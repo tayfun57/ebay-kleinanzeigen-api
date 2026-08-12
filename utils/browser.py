@@ -7,15 +7,26 @@ from utils.proxy_pool import ProxyPool
 
 logger = logging.getLogger(__name__)
 
-_BLOCKED_RESOURCE_TYPES = {"image", "script"}
+_BLOCKED_RESOURCE_TYPES = {"image", "script", "stylesheet", "font"}
+
+# A context reused hundreds of times in a row has been observed to start
+# silently returning empty result pages (HTTP 200, "success", zero listings)
+# for searches that a brand-new context resolves correctly — context.clear_cookies()
+# on release doesn't reset everything Kleinanzeigen can key a rate-limit/
+# fingerprint off (e.g. localStorage). Retiring contexts well before that
+# point trades a bit of context-creation overhead for not silently losing data.
+MAX_CONTEXT_USES = 50
 
 
 async def _block_heavy_resources(route):
-    """Aborts image and script requests — cuts proxy bandwidth by ~80-86%
-    (measured). All scraped fields (price, details table, features, search
-    results) are server-rendered HTML and unaffected; verified by diffing
-    full extraction output with/without JS. Only casualty: the JS-driven
-    view counter (extra_info.views), which nothing in this app consumes."""
+    """Aborts image/script/stylesheet/font requests — cuts proxy bandwidth by
+    ~80-86% (image+script) plus another ~62-74% on top (+stylesheet+font),
+    measured. All scraped fields (price, details table, features, search
+    results) are server-rendered HTML and unaffected by any of this — CSS/
+    fonts are pure rendering, not needed by page.query_selector(); verified
+    by diffing full extraction output with/without each blocked category.
+    Only casualty: the JS-driven view counter (extra_info.views), which
+    nothing in this app consumes."""
     if route.request.resource_type in _BLOCKED_RESOURCE_TYPES:
         await route.abort()
     else:
@@ -61,8 +72,18 @@ class OptimizedPlaywrightManager:
         # Performance metrics
         self._contexts_created = 0
         self._contexts_reused = 0
+        self._contexts_retired = 0
         self._concurrent_operations = 0
         self._max_concurrent_reached = 0
+        self._context_use_count: dict[int, int] = {}
+
+    async def _create_context(self) -> BrowserContext:
+        context = await self._browser.new_context(
+            user_agent=get_random_ua(), proxy=self._proxy_pool.next()
+        )
+        await context.route("**/*", _block_heavy_resources)
+        self._contexts_created += 1
+        return context
 
     async def start(self):
         """Initialize the browser and create initial context pool"""
@@ -72,12 +93,8 @@ class OptimizedPlaywrightManager:
         # Pre-create some contexts for the pool
         initial_contexts = min(3, self._max_contexts)
         for _ in range(initial_contexts):
-            context = await self._browser.new_context(
-                user_agent=get_random_ua(), proxy=self._proxy_pool.next()
-            )
-            await context.route("**/*", _block_heavy_resources)
+            context = await self._create_context()
             self._context_pool.append(context)
-            self._contexts_created += 1
 
     async def get_context(self) -> BrowserContext:
         """Get a browser context from the pool or create a new one"""
@@ -86,16 +103,14 @@ class OptimizedPlaywrightManager:
                 context = self._context_pool.pop()
                 self._context_in_use.append(context)
                 self._contexts_reused += 1
+                self._context_use_count[id(context)] = self._context_use_count.get(id(context), 0) + 1
                 return context
 
             # Create new context if pool is empty and under limit
             if len(self._context_in_use) < self._max_contexts:
-                context = await self._browser.new_context(
-                    user_agent=get_random_ua(), proxy=self._proxy_pool.next()
-                )
-                await context.route("**/*", _block_heavy_resources)
+                context = await self._create_context()
                 self._context_in_use.append(context)
-                self._contexts_created += 1
+                self._context_use_count[id(context)] = 1
                 return context
 
             # If we're at the limit, wait and try again
@@ -103,7 +118,8 @@ class OptimizedPlaywrightManager:
             return await self.get_context()
 
     async def release_context(self, context: BrowserContext):
-        """Return a context to the pool for reuse"""
+        """Return a context to the pool for reuse, or retire it once it's
+        been used MAX_CONTEXT_USES times (see the constant's docstring)."""
         async with self._context_lock:
             if context in self._context_in_use:
                 self._context_in_use.remove(context)
@@ -112,12 +128,22 @@ class OptimizedPlaywrightManager:
                 # don't carry Kleinanzeigen tracking cookies into the next request
                 for page in context.pages:
                     await page.close()
+
+                uses = self._context_use_count.get(id(context), 0)
+                if uses >= MAX_CONTEXT_USES:
+                    self._context_use_count.pop(id(context), None)
+                    self._contexts_retired += 1
+                    logger.info(f"[POOL] retiring context after {uses} uses")
+                    await context.close()
+                    return
+
                 await context.clear_cookies()
 
                 # Add back to pool if under limit, otherwise close it
                 if len(self._context_pool) < self._max_contexts // 2:
                     self._context_pool.append(context)
                 else:
+                    self._context_use_count.pop(id(context), None)
                     await context.close()
 
     async def execute_with_semaphore(self, coro):
@@ -153,6 +179,7 @@ class OptimizedPlaywrightManager:
         return {
             "contexts_created": self._contexts_created,
             "contexts_reused": self._contexts_reused,
+            "contexts_retired": self._contexts_retired,
             "contexts_in_pool": len(self._context_pool),
             "contexts_in_use": len(self._context_in_use),
             "max_contexts": self._max_contexts,
@@ -178,3 +205,4 @@ class OptimizedPlaywrightManager:
 
         self._context_pool.clear()
         self._context_in_use.clear()
+        self._context_use_count.clear()
